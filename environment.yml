@@ -1,0 +1,19 @@
+name: wheeled_model
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - cmake=3.27
+  - numpy
+  - pandas
+  - opencv
+  - quaternion
+  - onnx
+  - onnxruntime
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1

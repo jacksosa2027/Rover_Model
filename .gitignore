@@ -1,0 +1,7 @@
+.env
+how_to_run_sim.txt
+habitat-sim/
+.claude/
+.vscode/
+build/
+guide.py
