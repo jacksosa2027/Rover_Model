@@ -1,5 +1,6 @@
 name: wheeled_model
 channels:
+  - aihabitat
   - pytorch
   - nvidia
   - defaults
@@ -17,3 +18,4 @@ dependencies:
   - torchvision
   - torchaudio
   - pytorch-cuda=12.1
+  - habitat-sim=0.3.3=*_bullet_*

@@ -35,9 +35,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import onnxruntime as onnx
-
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -48,34 +45,34 @@ class AgentConfig:
     """All D3QN hyperparameters in one place."""
 
     # --- Network ---
-    n_actions: int      = 5         # Must match Action.COUNT in sim_env.py
-    input_channels: int = 4         # Frame stack depth (STACK_SIZE in preprocess.py)
+    n_actions: int      = 5         #Must match Action.COUNT in sim_env.py
+    input_channels: int = 4         #Frame stack depth (STACK_SIZE in preprocess.py)
     frame_h: int        = 84
     frame_w: int        = 84
 
     # --- Replay buffer ---
-    buffer_size: int    = 100_000   # Max transitions stored
-    batch_size: int     = 32        # Transitions sampled per learning step
+    buffer_size: int    = 100_000   #Max transitions stored
+    batch_size: int     = 32        #Transitions sampled per learning step
 
     # --- Learning ---
-    lr: float           = 1e-4      # Adam learning rate
-    gamma: float        = 0.99      # Discount factor
-    grad_clip: float    = 10.0      # Max gradient norm (prevents exploding gradients)
+    lr: float           = 0.001     #Adam learning rate
+    gamma: float        = 0.99      #Discount factor
+    grad_clip: float    = 10.0      #Max gradient norm (prevents exploding gradients)
 
     # --- Exploration (epsilon-greedy) ---
-    epsilon_start: float = 1.0      # Start fully random
-    epsilon_min: float   = 0.05     # Never drop below 5% random
-    epsilon_decay: float = 0.995    # Multiplicative decay per episode
+    epsilon_start: float = 1.0      #Start fully random
+    epsilon_min: float   = 0.05     #Never drop below 5% random
+    epsilon_decay: float = 0.995    #Multiplicative decay per episode
 
     # --- Target network ---
-    target_update_steps: int = 1_000   # Hard-copy online -> target every N steps
+    target_update_steps: int = 1_000   #Hard-copy online -> target every N steps
 
     # --- Training warm-up ---
-    min_buffer_size: int = 1_000    # Don't start learning until buffer has this many
+    min_buffer_size: int = 1_000    #Don't start learning until buffer has this many
 
 
 # ---------------------------------------------------------------------------
-# Replay buffer
+#Replay buffer
 # ---------------------------------------------------------------------------
 
 class ReplayBuffer:
@@ -92,10 +89,10 @@ class ReplayBuffer:
 
     def push(
         self,
-        state:      np.ndarray,   # (4, 84, 84)  float32
+        state:      np.ndarray,   #(4, 84, 84)  float32
         action:     int,
         reward:     float,
-        next_state: np.ndarray,   # (4, 84, 84)  float32
+        next_state: np.ndarray,   #(4, 84, 84)  float32
         done:       bool,
     ):
         self._buf.append((state, action, reward, next_state, done))
@@ -170,8 +167,8 @@ class D3QN(nn.Module):
             nn.Flatten(),
         )
 
-        # Compute the encoder's flat output size dynamically
-        # so the code stays correct if frame dimensions change.
+        #Compute the encoder's flat output size dynamically
+        #so the code stays correct if frame dimensions change.
         with torch.no_grad():
             dummy = torch.zeros(1, cfg.input_channels, cfg.frame_h, cfg.frame_w)
             encoder_out_size = self.encoder(dummy).shape[1]
@@ -276,7 +273,7 @@ class D3QNAgent:
         self.epsilon       = self.cfg.epsilon_start
         self.total_steps   = 0
         self.episodes      = 0
-        self.losses: list  = []   # Stored for logging in train.py
+        self.losses: deque = deque(maxlen=10_000)
 
     # -----------------------------------------------------------------------
     # Policy
@@ -510,7 +507,7 @@ class D3QNAgent:
         """Mean loss over the last `window` learning steps."""
         if not self.losses:
             return 0.0
-        return float(np.mean(self.losses[-window:]))
+        return float(np.mean(list(self.losses)[-window:]))
 
     def __repr__(self):
         buf = len(self.memory)

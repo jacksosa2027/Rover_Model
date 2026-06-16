@@ -229,6 +229,7 @@ class RoverEnv:
         backend_cfg = habitat_sim.SimulatorConfiguration()
         backend_cfg.scene_id = self.cfg.scene_path
         backend_cfg.enable_physics = True #Necessary for collision detection
+        backend_cfg.gpu_device_id = 0
 
         #RGB camera sensor
         rgb_sensor = habitat_sim.CameraSensorSpec()
@@ -261,10 +262,6 @@ class RoverEnv:
                 "turn_right",
                 habitat_sim.agent.ActuationSpec(amount=self.cfg.turn_step_degree)
             ),
-            "stop": habitat_sim.agent.ActionSpec(
-                "stop",
-                habitat_sim.agent.ActuationSpec(amount=0)
-            ),
         }
 
         sim_cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
@@ -285,6 +282,9 @@ class RoverEnv:
 
         Habitat-sim reports collisions via agent state after movement
         """
+        if action == Action.STOP:
+            return False
+
         action_name = self.ACTION_NAMES[action]
         self._agent.act(action_name)
 
