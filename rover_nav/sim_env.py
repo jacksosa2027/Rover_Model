@@ -21,6 +21,7 @@ Coordinate note:
     All position/rotation values are in metres and radians respectively.
 """
 
+import os
 import numpy as np
 import math
 import random
@@ -69,7 +70,13 @@ class RoverEnvConfig:
 
     #Spawn randomization
     min_spawn_distance_m: float = 1.5   #Min gaol-to-start distance at episode start
+    max_spawn_distance_m: Optional[float] = None  #Max goal-to-start distance; None = uncapped.
+                                                   #Set via RoverEnv.set_max_spawn_distance() to
+                                                   #drive a training curriculum (see train.py).
     max_spawn_attempts: int = 50        #Attempts to find a valid random spawn
+
+    #Goal vector normalization
+    goal_dist_norm_m: float = 10.0      #Distance (m) that normalizes to 1.0 in the goal vector
 
     #Sensor noise (optional, adds realism)
     add_sensor_noise: bool = False
@@ -123,14 +130,18 @@ class RoverEnv:
         self._build_simulator()
 
     #Public interface ---------------------------------------------------
-    def reset(self) -> np.ndarray:
+    def reset(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Start a new episode.
         Spawns the agent and goal at random navigable positions that are
         at least min_spawn_distance_m apart.
 
         Returns:
-            Raw RGB(A) observation, shape (H, W, 4), dtype uint8.
+            frame:    Raw RGB(A) observation, shape (H, W, 4), dtype uint8.
+            goal_vec: Egocentric goal vector, shape (2,) float32 --
+                      see _goal_vector() for details. A vision-only frame
+                      can't disambiguate where a randomly-placed goal is,
+                      so this is returned alongside it.
         """
 
         self._episode_count += 1
@@ -144,7 +155,8 @@ class RoverEnv:
         self._goal_pos = self._sample_navigable_point()
         agent_pos = self._sample_navigable_point_near(
             avoid=self._goal_pos,
-            min_dist=self.cfg.min_spawn_distance_m
+            min_dist=self.cfg.min_spawn_distance_m,
+            max_dist=self.cfg.max_spawn_distance_m,
         )
         self._place_agent(agent_pos)
 
@@ -154,9 +166,10 @@ class RoverEnv:
             self._goal_pos
         )
 
-        return self._get_observation()
-    
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
+        goal_vec = self._goal_vector(self._get_agent_pos(), self._prev_dist)
+        return self._get_observation(), goal_vec
+
+    def step(self, action: int) -> Tuple[Tuple[np.ndarray, np.ndarray], float, bool, dict]:
         """
         Execute one action in the environment.
 
@@ -164,7 +177,7 @@ class RoverEnv:
             action: Integer from Action.FORWARD,...,Action.STOP.
 
         Returns:
-            obs:    RGB(A) numpy array (H, W, 4)
+            obs:    (frame, goal_vec) tuple -- see reset() for details.
             reward: float
             done:   True if episode ended (goal reached, collision, timeout)
             info:   dict with diagnostic fields
@@ -174,7 +187,7 @@ class RoverEnv:
 
         self._step_count += 1
         collision = self._execute_action(action)
-        obs = self._get_observation()
+        frame = self._get_observation()
 
         agent_pos = self._get_agent_pos()
         curr_dist = self._geodesic_distance(agent_pos, self._goal_pos)
@@ -190,6 +203,8 @@ class RoverEnv:
         self._prev_dist = curr_dist
         done = goal_reached or timeout
 
+        goal_vec = self._goal_vector(agent_pos, curr_dist)
+
         info = {
             "step": self._step_count,
             "dist_to_goal": curr_dist,
@@ -199,7 +214,7 @@ class RoverEnv:
             "episode": self._episode_count,
         }
 
-        return obs, reward, done, info
+        return (frame, goal_vec), reward, done, info
     
     def close(self):
         """
@@ -217,7 +232,52 @@ class RoverEnv:
         Returns (H, W, 4) - The raw RGB(A) frame shape
         """
         return (self.cfg.resolution_h, self.cfg.resolution_w, 4)
-    
+
+    def get_goal_dim(self) -> int:
+        """
+        Returns the length of the goal vector returned alongside each frame.
+        Must match AgentConfig.goal_dim in agent.py.
+        """
+        return 2
+
+    def set_max_spawn_distance(self, max_dist: Optional[float]):
+        """
+        Update the max goal-to-start spawn distance used by future reset()
+        calls, without rebuilding the simulator. Pass None to remove the cap.
+
+        Used by train.py to drive a curriculum that starts with nearby goals
+        and expands the spawn radius as the agent's success rate improves.
+        """
+        self.cfg.max_spawn_distance_m = max_dist
+
+    def estimate_max_geodesic_distance_m(self, samples: int = 200, percentile: float = 95.0) -> float:
+        """
+        Estimate the hardest-case goal distance in this scene by sampling
+        random navigable point pairs and measuring their actual geodesic
+        distance -- the same distance metric used for rewards and for
+        max_spawn_distance_m, not a geometric proxy.
+
+        The navmesh's bounding-box diagonal was tried first and rejected: it
+        only bounds straight-line separation between two points, but
+        geodesic paths have to go around walls, so two points sitting close
+        together inside a modest bounding box can still be a long walk
+        apart in a winding corridor. Sampling real paths is the only way to
+        size a distance curriculum so its final stage actually covers the
+        hardest cases in *this* scene, instead of an arbitrary fixed
+        ceiling that may be far smaller than the real building.
+        """
+        distances = []
+        for _ in range(samples):
+            a = self._sample_navigable_point()
+            b = self._sample_navigable_point()
+            dist = self._geodesic_distance(a, b)
+            if dist < float("inf"):
+                distances.append(dist)
+
+        if not distances:
+            return 0.0
+        return float(np.percentile(distances, percentile))
+
 
     #Simulator construction ---------------------------------------------
     def _build_simulator(self):
@@ -228,7 +288,7 @@ class RoverEnv:
         #Backend config
         backend_cfg = habitat_sim.SimulatorConfiguration()
         backend_cfg.scene_id = self.cfg.scene_path
-        backend_cfg.enable_physics = True #Necessary for collision detection
+        backend_cfg.enable_physics = False
         backend_cfg.gpu_device_id = 0
 
         #RGB camera sensor
@@ -268,6 +328,14 @@ class RoverEnv:
         self._sim = habitat_sim.Simulator(sim_cfg)
         self._agent = self._sim.initialize_agent(0)
 
+        if not self._sim.pathfinder.is_loaded:
+            navmesh_settings = habitat_sim.NavMeshSettings()
+            navmesh_settings.set_defaults()
+            self._sim.recompute_navmesh(self._sim.pathfinder, navmesh_settings)
+            navmesh_path = os.path.splitext(self.cfg.scene_path)[0] + ".navmesh"
+            self._sim.pathfinder.save_nav_mesh(navmesh_path)
+            print(f"[RoverEnv] Navmesh saved to {navmesh_path}")
+
     ACTION_NAMES = {
         Action.FORWARD: "move_forward",
         Action.BACKWARD: "move_backward",
@@ -278,25 +346,16 @@ class RoverEnv:
 
     def _execute_action(self, action: int) -> bool:
         """
-        Execute the action and return whether a collision occured
+        Execute the action and return whether a collision occured.
 
-        Habitat-sim reports collisions via agent state after movement
+        habitat_sim.agent.Agent.act() returns this directly -- there is no
+        separate `previous_step_collided` flag on the simulator.
         """
         if action == Action.STOP:
             return False
 
         action_name = self.ACTION_NAMES[action]
-        self._agent.act(action_name)
-
-        #Check for collision (only meaningful for movement actions)
-        if action in (Action.FORWARD, Action.BACKWARD):
-            agent_state = self._agent.get_state()
-            return bool(
-                self._sim.previous_step_collided
-                if hasattr(self._sim, "previous_step_collided")
-                else False
-            )
-        return False
+        return bool(self._agent.act(action_name))
     
     #Reward -----------------------------------------------------
     def compute_reward(
@@ -332,6 +391,36 @@ class RoverEnv:
         return float(reward)
     
     #Navigation helpers
+    def _goal_vector(self, agent_pos: np.ndarray, dist: float) -> np.ndarray:
+        """
+        Egocentric goal vector: [normalized_distance, normalized_relative_heading].
+
+        A raw camera frame can't tell the agent which way a randomly-placed
+        goal is, so this gets passed through the pipeline alongside the
+        frame (see preprocess.FrameStack and agent.D3QN) as a PointGoal-style
+        sensor would in habitat-lab.
+
+        normalized_distance:  geodesic distance / goal_dist_norm_m, clipped to [0, 1]
+        normalized_heading:   angle from the agent's facing direction to the
+                               goal, in [-1, 1] where 0 = straight ahead,
+                               +/-1 = directly behind.
+        """
+        agent_state = self._agent.get_state()
+        q = agent_state.rotation
+        yaw = 2.0 * math.atan2(q.y, q.w)
+
+        dx = self._goal_pos[0] - agent_pos[0]
+        dz = self._goal_pos[2] - agent_pos[2]
+        bearing = math.atan2(-dx, -dz)
+
+        rel_heading = bearing - yaw
+        rel_heading = math.atan2(math.sin(rel_heading), math.cos(rel_heading))
+
+        norm_dist = min(dist / self.cfg.goal_dist_norm_m, 1.0)
+        norm_heading = rel_heading / math.pi
+
+        return np.array([norm_dist, norm_heading], dtype=np.float32)
+
     def _get_agent_pos(self) -> np.ndarray:
         """
         Returns the agent's XYZ position in world coordinates
@@ -362,20 +451,31 @@ class RoverEnv:
         self,
         avoid: np.ndarray,
         min_dist: float,
+        max_dist: Optional[float] = None,
     ) -> np.ndarray:
         """
-        Sample a navigable point that is at least min_dist meters from the avoid
-        position. Falls back to any navigable point if no valid spawn is found 
-        within max_psawn_attempts tries
+        Sample a navigable point whose geodesic distance from `avoid` is at
+        least min_dist meters and, if max_dist is given, at most max_dist
+        meters. The upper bound lets train.py run a curriculum that starts
+        with nearby goals and expands the spawn radius as the agent improves,
+        instead of sampling goals anywhere on the navmesh from episode 1.
+
+        Falls back to the closest min_dist-satisfying candidate seen (or any
+        navigable point, if none satisfied even that) if no candidate
+        satisfies both bounds within max_spawn_attempts tries.
         """
+        fallback = None
         for _ in range(self.cfg.max_spawn_attempts):
             candidate = self._sample_navigable_point()
             dist = self._geodesic_distance(candidate, avoid)
-            if dist >= min_dist:
+            if dist < min_dist:
+                continue
+            if max_dist is None or dist <= max_dist:
                 return candidate
-        
-        #Fallback: any navigable point (episode will be easy but valid)
-        return self._sample_navigable_point()
+            if fallback is None:
+                fallback = candidate
+
+        return fallback if fallback is not None else self._sample_navigable_point()
     
     def _place_agent(self, position: np.ndarray):
         """
@@ -493,19 +593,22 @@ if __name__ == "__main__":
     with RoverEnv(config=cfg) as env:
         print(f"  Action count:       {env.get_action_count()}")
         print(f"  Observation shape:  {env.get_observation_shape()}")
+        print(f"  Goal vector dim:    {env.get_goal_dim()}")
 
-        obs = env.reset()
-        print(f"  reset() -> obs.shape={obs.shape}, dtype={obs.dtype}")
-        assert obs.shape == (480, 640, 4)
+        frame, goal_vec = env.reset()
+        print(f"  reset() -> frame.shape={frame.shape}, dtype={frame.dtype}, goal_vec={goal_vec}")
+        assert frame.shape == (480, 640, 4)
+        assert goal_vec.shape == (2,)
 
         total_reward = 0.0
         for step in range(20):
             action = random.randint(0, Action.COUNT - 1)
-            obs, reward, done, info = env.step(action)
+            (frame, goal_vec), reward, done, info = env.step(action)
             total_reward += reward
             print(
                 f"  step {step+1:02d} | action={action} | "
                 f"reward={reward:+.3f} | dist={info['dist_to_goal']:.2f}m | "
+                f"goal_vec={goal_vec} | "
                 f"collision={info['collision']} | done={done}"
             )
             if done:

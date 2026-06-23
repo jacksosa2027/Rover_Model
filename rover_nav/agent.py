@@ -49,6 +49,7 @@ class AgentConfig:
     input_channels: int = 4         #Frame stack depth (STACK_SIZE in preprocess.py)
     frame_h: int        = 84
     frame_w: int        = 84
+    goal_dim: int       = 2         #Must match RoverEnv.get_goal_dim() in sim_env.py
 
     # --- Replay buffer ---
     buffer_size: int    = 100_000   #Max transitions stored
@@ -89,32 +90,41 @@ class ReplayBuffer:
 
     def push(
         self,
-        state:      np.ndarray,   #(4, 84, 84)  float32
+        state:      dict,   #{"frames": (4, 84, 84) float32, "goal": (2,) float32}
         action:     int,
         reward:     float,
-        next_state: np.ndarray,   #(4, 84, 84)  float32
+        next_state: dict,
         done:       bool,
     ):
-        self._buf.append((state, action, reward, next_state, done))
+        self._buf.append((
+            state["frames"], state["goal"],
+            action, reward,
+            next_state["frames"], next_state["goal"],
+            done,
+        ))
 
     def sample(self, batch_size: int) -> Tuple:
         """
         Draw a random batch and return stacked numpy arrays.
 
         Returns:
-            states      (B, 4, 84, 84)  float32
+            frames      (B, 4, 84, 84)  float32
+            goals       (B, goal_dim)   float32
             actions     (B,)            int64
             rewards     (B,)            float32
-            next_states (B, 4, 84, 84)  float32
+            next_frames (B, 4, 84, 84)  float32
+            next_goals  (B, goal_dim)   float32
             dones       (B,)            float32  (1.0 = terminal)
         """
         batch = random.sample(self._buf, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        frames, goals, actions, rewards, next_frames, next_goals, dones = zip(*batch)
         return (
-            np.array(states,      dtype=np.float32),
+            np.array(frames,      dtype=np.float32),
+            np.array(goals,       dtype=np.float32),
             np.array(actions,     dtype=np.int64),
             np.array(rewards,     dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
+            np.array(next_frames, dtype=np.float32),
+            np.array(next_goals,  dtype=np.float32),
             np.array(dones,       dtype=np.float32),
         )
 
@@ -173,16 +183,21 @@ class D3QN(nn.Module):
             dummy = torch.zeros(1, cfg.input_channels, cfg.frame_h, cfg.frame_w)
             encoder_out_size = self.encoder(dummy).shape[1]
 
+        #The goal vector (distance + relative heading to a randomly-placed
+        #goal) is concatenated onto the visual features -- pixels alone
+        #can't encode where an arbitrary per-episode goal is.
+        head_in_size = encoder_out_size + cfg.goal_dim
+
         # --- Value stream ---
         self.value_stream = nn.Sequential(
-            nn.Linear(encoder_out_size, 512),
+            nn.Linear(head_in_size, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 1),
         )
 
         # --- Advantage stream ---
         self.advantage_stream = nn.Sequential(
-            nn.Linear(encoder_out_size, 512),
+            nn.Linear(head_in_size, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, cfg.n_actions),
         )
@@ -202,15 +217,17 @@ class D3QN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 4, 84, 84) float32, values in [0, 1].
+            frames: (B, 4, 84, 84) float32, values in [0, 1].
+            goal:   (B, goal_dim) float32, egocentric [distance, relative_heading].
 
         Returns:
             Q-values: (B, n_actions) float32.
         """
-        features  = self.encoder(x)
+        visual_features = self.encoder(frames)
+        features  = torch.cat([visual_features, goal], dim=1)
         value     = self.value_stream(features)        # (B, 1)
         advantage = self.advantage_stream(features)    # (B, n_actions)
 
@@ -218,18 +235,19 @@ class D3QN(nn.Module):
         q = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
 
-    def get_action(self, x: torch.Tensor) -> int:
+    def get_action(self, frames: torch.Tensor, goal: torch.Tensor) -> int:
         """
         Greedy action for a single state (no gradient).
 
         Args:
-            x: (1, 4, 84, 84) float32 tensor already on the correct device.
+            frames: (1, 4, 84, 84) float32 tensor already on the correct device.
+            goal:   (1, goal_dim) float32 tensor already on the correct device.
 
         Returns:
             Integer action index.
         """
         with torch.no_grad():
-            return int(self.forward(x).argmax(dim=1).item())
+            return int(self.forward(frames, goal).argmax(dim=1).item())
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +297,7 @@ class D3QNAgent:
     # Policy
     # -----------------------------------------------------------------------
 
-    def select_action(self, state: np.ndarray) -> int:
+    def select_action(self, state: dict) -> int:
         """
         Epsilon-greedy action selection.
 
@@ -287,7 +305,7 @@ class D3QNAgent:
         Otherwise:               greedy action from online network (exploitation).
 
         Args:
-            state: numpy array (4, 84, 84), float32, values in [0, 1].
+            state: {"frames": (4, 84, 84) float32, "goal": (goal_dim,) float32}
 
         Returns:
             Integer action index.
@@ -295,12 +313,9 @@ class D3QNAgent:
         if random.random() < self.epsilon:
             return random.randint(0, self.cfg.n_actions - 1)
 
-        state_t = (
-            torch.FloatTensor(state)
-            .unsqueeze(0)           # (1, 4, 84, 84)
-            .to(self.device)
-        )
-        return self.online_net.get_action(state_t)
+        frames_t = torch.FloatTensor(state["frames"]).unsqueeze(0).to(self.device)
+        goal_t   = torch.FloatTensor(state["goal"]).unsqueeze(0).to(self.device)
+        return self.online_net.get_action(frames_t, goal_t)
 
     def decay_epsilon(self):
         """
@@ -319,10 +334,10 @@ class D3QNAgent:
 
     def remember(
         self,
-        state:      np.ndarray,
+        state:      dict,
         action:     int,
         reward:     float,
-        next_state: np.ndarray,
+        next_state: dict,
         done:       bool,
     ):
         """Store a transition in the replay buffer."""
@@ -347,13 +362,15 @@ class D3QNAgent:
         if len(self.memory) < self.cfg.min_buffer_size:
             return None
 
-        states, actions, rewards, next_states, dones = self.memory.sample(
-            self.cfg.batch_size
+        frames, goals, actions, rewards, next_frames, next_goals, dones = (
+            self.memory.sample(self.cfg.batch_size)
         )
 
         # Move all tensors to device in one block
-        states_t      = torch.FloatTensor(states).to(self.device)
-        next_states_t = torch.FloatTensor(next_states).to(self.device)
+        frames_t      = torch.FloatTensor(frames).to(self.device)
+        goals_t       = torch.FloatTensor(goals).to(self.device)
+        next_frames_t = torch.FloatTensor(next_frames).to(self.device)
+        next_goals_t  = torch.FloatTensor(next_goals).to(self.device)
         actions_t     = torch.LongTensor(actions).to(self.device)
         rewards_t     = torch.FloatTensor(rewards).to(self.device)
         dones_t       = torch.FloatTensor(dones).to(self.device)
@@ -361,16 +378,16 @@ class D3QNAgent:
         # --- Double DQN target ---
         with torch.no_grad():
             # Online net picks the best action in next state
-            best_next_actions = self.online_net(next_states_t).argmax(dim=1)  # (B,)
+            best_next_actions = self.online_net(next_frames_t, next_goals_t).argmax(dim=1)  # (B,)
             # Target net evaluates that action
-            q_next = self.target_net(next_states_t).gather(
+            q_next = self.target_net(next_frames_t, next_goals_t).gather(
                 1, best_next_actions.unsqueeze(1)
             ).squeeze(1)                                                        # (B,)
             # Bellman target (zero out terminal states)
             q_target = rewards_t + self.cfg.gamma * q_next * (1.0 - dones_t) # (B,)
 
         # --- Online net prediction ---
-        q_pred = self.online_net(states_t).gather(
+        q_pred = self.online_net(frames_t, goals_t).gather(
             1, actions_t.unsqueeze(1)
         ).squeeze(1)                                                            # (B,)
 
@@ -440,7 +457,7 @@ class D3QNAgent:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.online_net.load_state_dict(checkpoint["online_net"])
         self.target_net.load_state_dict(checkpoint["target_net"])
@@ -480,20 +497,21 @@ class D3QNAgent:
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.online_net.eval()
-        dummy = torch.zeros(
+        dummy_frames = torch.zeros(
             1,
             self.cfg.input_channels,
             self.cfg.frame_h,
             self.cfg.frame_w,
         ).to(self.device)
+        dummy_goal = torch.zeros(1, self.cfg.goal_dim).to(self.device)
 
         torch.onnx.export(
             self.online_net,
-            dummy,
+            (dummy_frames, dummy_goal),
             path,
-            input_names=["state"],
+            input_names=["frames", "goal"],
             output_names=["q_values"],
-            dynamic_axes={"state": {0: "batch_size"}},
+            dynamic_axes={"frames": {0: "batch_size"}, "goal": {0: "batch_size"}},
             opset_version=17,
         )
         print(f"[D3QNAgent] ONNX model exported -> {path}")
@@ -534,8 +552,14 @@ if __name__ == "__main__":
 
     # Simulate transitions
     for i in range(200):
-        state      = np.random.rand(4, 84, 84).astype(np.float32)
-        next_state = np.random.rand(4, 84, 84).astype(np.float32)
+        state = {
+            "frames": np.random.rand(4, 84, 84).astype(np.float32),
+            "goal":   np.random.uniform(-1, 1, size=(cfg.goal_dim,)).astype(np.float32),
+        }
+        next_state = {
+            "frames": np.random.rand(4, 84, 84).astype(np.float32),
+            "goal":   np.random.uniform(-1, 1, size=(cfg.goal_dim,)).astype(np.float32),
+        }
         action     = agent.select_action(state)
         reward     = np.random.uniform(-1, 1)
         done       = i % 50 == 49
@@ -567,13 +591,15 @@ if __name__ == "__main__":
             "exports/smoke_test.onnx",
             providers=["CPUExecutionProvider"]
         )
-        dummy = np.random.rand(1, 4, 84, 84).astype(np.float32)
-        ort_out = sess.run(None, {"state": dummy})[0]
+        dummy_frames = np.random.rand(1, 4, 84, 84).astype(np.float32)
+        dummy_goal = np.random.uniform(-1, 1, size=(1, cfg.goal_dim)).astype(np.float32)
+        ort_out = sess.run(None, {"frames": dummy_frames, "goal": dummy_goal})[0]
 
         agent.online_net.eval()
         with torch.no_grad():
             pt_out = agent.online_net(
-                torch.FloatTensor(dummy).to(agent.device)
+                torch.FloatTensor(dummy_frames).to(agent.device),
+                torch.FloatTensor(dummy_goal).to(agent.device),
             ).cpu().numpy()
 
         max_diff = np.abs(ort_out - pt_out).max()

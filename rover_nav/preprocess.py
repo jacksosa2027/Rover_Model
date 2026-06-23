@@ -13,6 +13,7 @@ The 4-frame stack gives the agent temporal context so it can percieve motion fro
 import cv2
 import numpy as np
 from collections import deque
+from typing import Tuple
 
 
 FRAME_HEIGHT = 84
@@ -85,12 +86,19 @@ def apply_domain_randomization(frame: np.ndarray) -> np.ndarray:
 
 class FrameStack:
     """
-    Maintains a rolling buffer of the last STACK_SIZE preprocessed frames.
+    Maintains a rolling buffer of the last STACK_SIZE preprocessed frames,
+    paired with the most recent egocentric goal vector from RoverEnv.
+
+    A raw camera frame can't tell the agent where a randomly-placed goal
+    is, so RoverEnv.reset()/step() return (frame, goal_vec) tuples; this
+    class stacks the frames for temporal context and passes the goal
+    vector through unchanged (it's already a complete instantaneous
+    signal, so it isn't stacked).
 
     Usage:
         stack = FrameStack()
-        state = stack.reset(first_frame) #shape (4, 84, 84)
-        state = stack.step(next_frame)   #shape (4, 84, 84)
+        state = stack.reset((first_frame, goal_vec))  #{"frames": (4,84,84), "goal": (2,)}
+        state = stack.step((next_frame, goal_vec))
     """
 
     def __init__(self, size: int = STACK_SIZE, augment: bool = False):
@@ -104,44 +112,48 @@ class FrameStack:
         self.augment = augment
         self._frames: deque = deque(maxlen=size)
 
-    def reset(self, frame: np.ndarray) -> np.ndarray:
+    def reset(self, obs: Tuple[np.ndarray, np.ndarray]) -> dict:
         """
         Call at the start of every episode. Fills the buffer with copies of the first frame so there are no 'empty' slots
         at episode start.
 
-        Arguments;
-            frame: raw RGB(A) observation from habitat-sim
+        Arguments:
+            obs: (frame, goal_vec) tuple from RoverEnv.reset()
 
         Returns:
-            numpy array of shape (STACK_SIZE, 84, 84), float32.
+            dict with "frames": (STACK_SIZE, 84, 84) float32, "goal": (2,) float32
         """
-
+        frame, goal_vec = obs
         if self.augment:
             frame = apply_domain_randomization(frame)
         processed = preprocess_frame(frame)
         self._frames.clear()
         for _ in range(self.size):
             self._frames.append(processed)
-        return self._get_state()
+        return self._get_state(goal_vec)
 
-    def step(self, frame: np.ndarray) -> np.ndarray:
+    def step(self, obs: Tuple[np.ndarray, np.ndarray]) -> dict:
         """
         Call every environment step. Adds the new frame and drops the oldest.
 
         Arguments:
-            frame: raw RGB(A) observation from habitat-sim
+            obs: (frame, goal_vec) tuple from RoverEnv.step()
 
         Returns:
-            numpy arrayo of shape (STACK_SIZE, 84, 84), float32.
+            dict with "frames": (STACK_SIZE, 84, 84) float32, "goal": (2,) float32
         """
-
+        frame, goal_vec = obs
         if self.augment:
             frame = apply_domain_randomization(frame)
         self._frames.append(preprocess_frame(frame))
-        return self._get_state()
-    
-    def _get_state(self) -> np.ndarray:
+        return self._get_state(goal_vec)
+
+    def _get_state(self, goal_vec: np.ndarray) -> dict:
         """
-        Stack the buffer into a single array (STACK_SIZE, H, W).
+        Stack the buffer into a single array (STACK_SIZE, H, W) and pair
+        it with the current goal vector.
         """
-        return np.stack(list(self._frames), axis=0)
+        return {
+            "frames": np.stack(list(self._frames), axis=0),
+            "goal": np.asarray(goal_vec, dtype=np.float32),
+        }
