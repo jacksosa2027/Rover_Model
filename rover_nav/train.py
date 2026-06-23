@@ -23,10 +23,12 @@ Usage:
 
 import argparse
 import csv
+import fcntl
 import json
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -55,8 +57,7 @@ class TrainConfig:
     log_every:       int = 10        # Print progress every N episodes
     checkpoint_every: int = 250      # Save model every N episodes
     checkpoint_dir:  str = "checkpoints"
-    log_csv_path:    str = "logs/training_log.csv"
-    success_plot_path: str = "logs/success_rate.png"
+    log_dir:         str = "logs"    # actual logs/plots go in log_dir/<scene_name>/, like checkpoint_dir
     use_augmentation: bool = True    # Domain randomization during training
     resume_path:     Optional[str] = None
     seed:            int = 42
@@ -163,13 +164,27 @@ class TrainingLogger:
 
         is_new = not os.path.exists(csv_path)
         self._file = open(csv_path, "a", newline="")
+
+        # Exclusive, non-blocking lock: two unsynchronized processes
+        # appending to the same file is almost certainly what produced the
+        # NUL-byte corruption found earlier in this project's actual log.
+        # Fail fast and clearly instead of silently corrupting the file.
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._file.close()
+            raise RuntimeError(
+                f"{csv_path} is already locked by another process. Two unsynchronized "
+                "training runs writing to the same log file corrupt it -- if you intended "
+                "this, you'll need a separate log_dir/checkpoint_dir per run."
+            )
+
         self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
         if is_new:
             self._writer.writeheader()
 
         self._recent_rewards = []
         self._recent_goals = []
-        self._success_rate_history = []  # (episode, rolling success rate %) for plotting
 
     def log(self, episode: int, metrics: dict, elapsed_sec: float):
         row = {
@@ -190,7 +205,6 @@ class TrainingLogger:
         # Keep a rolling window of the last 100 episodes for summaries
         self._recent_rewards = self._recent_rewards[-100:]
         self._recent_goals = self._recent_goals[-100:]
-        self._success_rate_history.append((episode, self.success_rate))
 
     @property
     def success_rate(self) -> float:
@@ -209,18 +223,66 @@ class TrainingLogger:
             f"success_rate={success_rate:5.1f}%  "
         )
 
-    def plot_success_rate(self, save_path: str):
-        """Save a PNG of the rolling (last-100) success rate over the run."""
-        if not self._success_rate_history:
+    def _read_full_history(self):
+        """
+        Read every episode ever logged to csv_path -- across this process
+        and every prior --resume session, since they all append to the same
+        file. Plotting from disk instead of in-memory history means the
+        plots show the full run, not just whatever this process has seen.
+
+        Tolerates stray NUL bytes and duplicate episode numbers (both seen
+        in practice after resuming from an older checkpoint than
+        d3qn_latest.pt, which re-logs episode numbers that already exist)
+        by de-duplicating on episode number, keeping the last occurrence on
+        disk, and returning everything sorted by episode.
+
+        Returns sorted (episodes, rewards, steps, goal_reached) numpy arrays.
+        """
+        if not os.path.exists(self.csv_path):
+            return np.array([]), np.array([]), np.array([]), np.array([])
+
+        with open(self.csv_path, "r", errors="replace") as f:
+            content = f.read().replace("\x00", "")
+
+        by_episode = {}
+        for row in csv.DictReader(content.splitlines()):
+            try:
+                by_episode[int(row["episode"])] = row
+            except (KeyError, ValueError):
+                continue
+
+        episodes = sorted(by_episode)
+        rewards = np.array([float(by_episode[e]["reward"]) for e in episodes])
+        steps = np.array([int(by_episode[e]["steps"]) for e in episodes])
+        goal_reached = np.array([bool(int(by_episode[e]["goal_reached"])) for e in episodes])
+        return np.array(episodes), rewards, steps, goal_reached
+
+    def max_logged_episode(self) -> int:
+        """Highest episode number already on disk, or 0 if nothing's logged yet."""
+        episodes, _, _, _ = self._read_full_history()
+        return int(episodes[-1]) if len(episodes) else 0
+
+    def plot_success_rate(self, save_path: str, window: int = 100):
+        """Save a PNG of the rolling success rate over the full logged history."""
+        episodes, _, _, goal_reached = self._read_full_history()
+        if len(episodes) == 0:
             return
 
-        episodes, rates = zip(*self._success_rate_history)
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        rates = np.empty(len(episodes))
+        buf = deque()
+        window_sum = 0
+        for i, g in enumerate(goal_reached):
+            buf.append(g)
+            window_sum += g
+            if len(buf) > window:
+                window_sum -= buf.popleft()
+            rates[i] = window_sum / len(buf) * 100
 
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         plt.figure(figsize=(10, 5))
         plt.plot(episodes, rates)
         plt.xlabel("Episode")
-        plt.ylabel("Success rate, % (rolling last 100 episodes)")
+        plt.ylabel(f"Success rate, % (rolling last {window} episodes)")
         plt.title("D3QN Training Success Rate")
         plt.ylim(0, 100)
         plt.grid(True, alpha=0.3)
@@ -228,8 +290,61 @@ class TrainingLogger:
         plt.close()
         print(f"[train.py] Success rate plot saved to {save_path}")
 
+    def plot_avg_reward(self, save_path: str, bucket_size: int = 100):
+        """Save a PNG of average reward over the full logged history, bucketed every bucket_size episodes."""
+        episodes, rewards, _, _ = self._read_full_history()
+        if len(episodes) == 0:
+            return
+
+        bucket_episodes, bucket_avg_rewards = [], []
+        for lo in range(0, len(episodes), bucket_size):
+            hi = min(lo + bucket_size, len(episodes))
+            bucket_episodes.append(episodes[hi - 1])
+            bucket_avg_rewards.append(rewards[lo:hi].mean())
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.figure(figsize=(10, 5))
+        plt.plot(bucket_episodes, bucket_avg_rewards)
+        plt.xlabel("Episode")
+        plt.ylabel(f"Avg reward (per {bucket_size}-episode bucket)")
+        plt.title("D3QN Training Average Reward")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(save_path)
+        plt.close()
+        print(f"[train.py] Average reward plot saved to {save_path}")
+
+    def plot_avg_steps_to_goal(self, save_path: str, bucket_size: int = 100):
+        """
+        Save a PNG of average steps-to-goal over the full logged history,
+        bucketed every bucket_size episodes. Only successful episodes count
+        toward the average (steps in a failed/timed-out episode don't mean
+        "how long it took to reach the goal") -- buckets with zero
+        successes are left as gaps.
+        """
+        episodes, _, steps, goal_reached = self._read_full_history()
+        if len(episodes) == 0:
+            return
+
+        bucket_episodes, bucket_avg_steps = [], []
+        for lo in range(0, len(episodes), bucket_size):
+            hi = min(lo + bucket_size, len(episodes))
+            successes = goal_reached[lo:hi]
+            bucket_episodes.append(episodes[hi - 1])
+            bucket_avg_steps.append(steps[lo:hi][successes].mean() if successes.any() else np.nan)
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.figure(figsize=(10, 5))
+        plt.plot(bucket_episodes, bucket_avg_steps, marker="o", markersize=3)
+        plt.xlabel("Episode")
+        plt.ylabel(f"Avg steps to goal, success only (per {bucket_size}-episode bucket)")
+        plt.title("D3QN Training Average Steps to Goal")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(save_path)
+        plt.close()
+        print(f"[train.py] Average steps-to-goal plot saved to {save_path}")
+
     def close(self):
-        self._file.close()
+        self._file.close()  # also releases the flock acquired in __init__
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +385,16 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
     checkpoint_dir = os.path.join(train_cfg.checkpoint_dir, scene_name)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Scene-specific, like checkpoint_dir -- a fixed shared path here would
+    # mean training a different scene appends into (and silently merges
+    # with, once read back for plotting) this scene's history.
+    log_dir = os.path.join(train_cfg.log_dir, scene_name)
+    os.makedirs(log_dir, exist_ok=True)
+    log_csv_path = os.path.join(log_dir, "training_log.csv")
+    success_plot_path = os.path.join(log_dir, "success_rate.png")
+    reward_plot_path = os.path.join(log_dir, "avg_reward.png")
+    steps_plot_path = os.path.join(log_dir, "avg_steps_to_goal.png")
+
     current_max_dist = train_cfg.curriculum_start_m if train_cfg.curriculum_enabled else None
     env_cfg.max_spawn_distance_m = current_max_dist
 
@@ -287,34 +412,40 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
         scene_p95_dist_m = env.estimate_max_geodesic_distance_m()
         curriculum_final_m = max(train_cfg.curriculum_final_m, scene_p95_dist_m * 1.2)
 
-    print("=" * 60)
-    print("D3QN Indoor Rover Navigation - Training")
-    print("=" * 60)
-    print(f"  Scene:       {env_cfg.scene_path}")
-    print(f"  Episodes:    {train_cfg.episodes}")
-    print(f"  Augment:     {train_cfg.use_augmentation}")
-    print(f"  Checkpoints: {checkpoint_dir}")
-    if train_cfg.curriculum_enabled:
-        print(
-            f"  Curriculum:  start={train_cfg.curriculum_start_m}m  "
-            f"step={train_cfg.curriculum_step_m}m  "
-            f"final={curriculum_final_m:.1f}m (uncapped beyond this; "
-            f"p95 geodesic distance ~{scene_p95_dist_m:.1f}m)  "
-            f"threshold={train_cfg.curriculum_threshold * 100:.0f}% success"
-        )
-    else:
-        print("  Curriculum:  disabled (goals sampled anywhere on the navmesh)")
-    print("=" * 60)
-
     frame_stack = FrameStack(augment=train_cfg.use_augmentation)
     agent = D3QNAgent(agent_cfg)
-    logger = TrainingLogger(train_cfg.log_csv_path)
+    logger = TrainingLogger(log_csv_path)
 
     start_episode = 1
+    curriculum_state_note = None
     if train_cfg.resume_path:
         agent.load(train_cfg.resume_path, eval_mode=False)
         start_episode = agent.episodes + 1
-        print(f"  Resuming from episode {start_episode}")
+
+        max_logged = logger.max_logged_episode()
+        if max_logged == 0 and agent.episodes > 0:
+            print(
+                f"  WARNING: resuming from episode {agent.episodes}, but {log_csv_path} "
+                "has no logged history. The log may have been deleted or moved -- "
+                "plots will be missing everything before this run."
+            )
+        elif max_logged >= start_episode:
+            print(
+                f"  WARNING: {log_csv_path} already has entries up to episode {max_logged}, "
+                f"but this run resumes from episode {start_episode} -- "
+                f"'{train_cfg.resume_path}' is behind the most recently logged progress. "
+                f"Episodes {start_episode}-{max_logged} will be OVERWRITTEN in the log/plots "
+                "with this run's new trajectory as it catches back up, diverging from "
+                "whatever produced the data that's there now."
+            )
+            try:
+                response = input("  Type 'yes' to continue anyway, or anything else to abort: ").strip().lower()
+            except EOFError:
+                response = ""
+            if response != "yes":
+                raise SystemExit(
+                    "[train.py] Aborted -- resume checkpoint is behind already-logged progress."
+                )
 
         if train_cfg.curriculum_enabled:
             state_path = _curriculum_state_path(checkpoint_dir)
@@ -322,12 +453,34 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
                 with open(state_path) as f:
                     current_max_dist = json.load(f)["max_spawn_distance_m"]
                 env.set_max_spawn_distance(current_max_dist)
-                print(f"  Curriculum resumed at max_spawn_distance={current_max_dist}")
+                curriculum_state_note = f"resumed from {state_path}"
             else:
-                print(
-                    f"  No curriculum_state.json in {checkpoint_dir} -- "
-                    f"restarting curriculum at {current_max_dist}m."
-                )
+                curriculum_state_note = f"no {state_path} found -- restarting curriculum"
+
+    # Printed after resume so it reflects what's actually in effect for the
+    # next episode, not the schedule's static defaults -- e.g. on resume,
+    # current_max_dist may already be far past curriculum_start_m.
+    print("=" * 60)
+    print("D3QN Indoor Rover Navigation - Training")
+    print("=" * 60)
+    print(f"  Scene:       {env_cfg.scene_path}")
+    print(f"  Episodes:    {train_cfg.episodes}  (starting at {start_episode})")
+    print(f"  Augment:     {train_cfg.use_augmentation}")
+    print(f"  Checkpoints: {checkpoint_dir}")
+    if train_cfg.curriculum_enabled:
+        current_dist_label = "uncapped" if current_max_dist is None else f"{current_max_dist:.1f}m"
+        print(
+            f"  Curriculum:  current={current_dist_label}  "
+            f"step={train_cfg.curriculum_step_m}m  "
+            f"final={curriculum_final_m:.1f}m (uncapped beyond this; "
+            f"p95 geodesic distance ~{scene_p95_dist_m:.1f}m)  "
+            f"threshold={train_cfg.curriculum_threshold * 100:.0f}% success"
+        )
+        if curriculum_state_note:
+            print(f"               ({curriculum_state_note})")
+    else:
+        print("  Curriculum:  disabled (goals sampled anywhere on the navmesh)")
+    print("=" * 60)
 
     best_success_rate = 0.0
 
@@ -404,7 +557,9 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
 
     finally:
         env.close()
-        logger.plot_success_rate(train_cfg.success_plot_path)
+        logger.plot_success_rate(success_plot_path)
+        logger.plot_avg_reward(reward_plot_path)
+        logger.plot_avg_steps_to_goal(steps_plot_path)
         logger.close()
         print("\n[train.py] Training run finished. Resources released.")
 
