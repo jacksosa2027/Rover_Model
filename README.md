@@ -16,6 +16,18 @@ This codebase is used to generate computer vision models that will be used for t
 
 A Dueling Double Deep Q-Network (D3QN) is a deep reinforcement learning (DRL) algorithm that combines two critical advancements in the DQN family: the dueling network architecture and double Q-learning. This hybrid architecture has been empirically validated to improve the efficiency and stability of value-based deep reinforcement learning in high-dimensional, noisy environments across robotics.
 
+D3QN unifies two enhancements to the original DQN:
+
+- **Dueling Architecture:** The value function $V(s)$ and the advantage function $A(s,a)$ are estimated in parallel, with the final Q-value computed as
+
+$$Q(s,a;\theta) = V(s;\theta,\beta) + \left[A(s,a;\theta,\alpha) - \frac{1}{|A|}\sum_{a'} A(s,a';\theta,\alpha)\right].$$
+
+  This formulation enables the network to learn the state-value function independently of the action, improving evaluation in settings with many similar-valued actions.
+
+- **Double Q-Learning:** To address maximization bias, D3QN decouples the action selection and evaluation in the target:
+
+$$y_t = r_t + \gamma Q(s_{t+1}, \arg\max_{a'} Q(s_{t+1}, a'; \theta_t); \theta^-).$$
+
 # Install
 
 ## Prerequisites
