@@ -55,7 +55,7 @@ class TrainConfig:
     episodes:        int = 5_000
     learn_every:     int = 4         # Gradient step every N env steps
     log_every:       int = 10        # Print progress every N episodes
-    checkpoint_every: int = 250      # Save model every N episodes
+    checkpoint_every: int = 5_000    # Save model every N episodes
     checkpoint_dir:  str = "checkpoints"
     log_dir:         str = "logs"    # actual logs/plots go in log_dir/<scene_name>/, like checkpoint_dir
     use_augmentation: bool = True    # Domain randomization during training
@@ -76,6 +76,16 @@ class TrainConfig:
     curriculum_threshold:    float = 0.5    # rolling-100 success rate needed to advance
     curriculum_min_episodes: int   = 100    # episodes of history required before checking
     curriculum_check_every:  int   = 50     # episodes between advancement checks
+    curriculum_regress_patience: int = 10   # consecutive failed checks of sustained
+                                             # sub-threshold success before stepping
+                                             # the distance back down -- advancing is a
+                                             # one-way ratchet otherwise, which can push
+                                             # into a distance the agent never recovers from
+    pin_distance_m: Optional[float] = None  # freeze max_spawn_distance here, disabling
+                                             # auto-advance/regress entirely -- for
+                                             # deliberately consolidating at a fixed
+                                             # distance before letting the curriculum
+                                             # move again
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +225,16 @@ class TrainingLogger:
         return len(self._recent_goals)
 
     def print_summary(self, episode: int, total_episodes: int):
-        avg_reward = np.mean(self._recent_rewards) if self._recent_rewards else 0.0
+        # Last 10, not the full last-100 window -- this is printed every
+        # log_every (default 10) episodes, so last10 reflects only what's
+        # happened since the previous printed line instead of overlapping
+        # with the last nine lines' worth of history.
+        recent10 = self._recent_rewards[-10:]
+        avg_reward = np.mean(recent10) if recent10 else 0.0
         success_rate = np.mean(self._recent_goals) * 100 if self._recent_goals else 0.0
         print(
             f"[{episode:5d}/{total_episodes}] "
-            f"avg_reward(last100)={avg_reward:+7.3f}  "
+            f"avg_reward(last10)={avg_reward:+7.3f}  "
             f"success_rate={success_rate:5.1f}%  "
         )
 
@@ -396,6 +411,11 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
     steps_plot_path = os.path.join(log_dir, "avg_steps_to_goal.png")
 
     current_max_dist = train_cfg.curriculum_start_m if train_cfg.curriculum_enabled else None
+    if train_cfg.pin_distance_m is not None:
+        current_max_dist = train_cfg.pin_distance_m
+        # Persisted so that a later resume *without* --pin-distance picks up
+        # from here, instead of from whatever stale state predates the pin.
+        _save_curriculum_state(checkpoint_dir, current_max_dist)
     env_cfg.max_spawn_distance_m = current_max_dist
 
     env = RoverEnv(config=env_cfg)
@@ -447,7 +467,12 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
                     "[train.py] Aborted -- resume checkpoint is behind already-logged progress."
                 )
 
-        if train_cfg.curriculum_enabled:
+        if train_cfg.pin_distance_m is not None:
+            # The pin always wins -- no need to consult curriculum_state.json
+            # (or warn about it) since we're about to override it regardless.
+            env.set_max_spawn_distance(current_max_dist)
+            curriculum_state_note = f"pinned at {current_max_dist}m, ignoring any prior curriculum state"
+        elif train_cfg.curriculum_enabled:
             state_path = _curriculum_state_path(checkpoint_dir)
             if os.path.exists(state_path):
                 with open(state_path) as f:
@@ -455,6 +480,25 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
                 env.set_max_spawn_distance(current_max_dist)
                 curriculum_state_note = f"resumed from {state_path}"
             else:
+                print(
+                    f"  WARNING: no {state_path} found, but resuming from episode "
+                    f"{start_episode}. The curriculum will restart at "
+                    f"{train_cfg.curriculum_start_m}m instead of wherever this "
+                    "checkpoint's training had actually reached -- if this checkpoint "
+                    "was trained with a curriculum before, that progress is about to be "
+                    "silently discarded (this is exactly how a 70k-episode run ended up "
+                    "back at a small capped distance once already)."
+                )
+                try:
+                    response = input(
+                        "  Type 'yes' to restart the curriculum anyway, or anything else to abort: "
+                    ).strip().lower()
+                except EOFError:
+                    response = ""
+                if response != "yes":
+                    raise SystemExit(
+                        "[train.py] Aborted -- curriculum_state.json missing for this checkpoint_dir."
+                    )
                 curriculum_state_note = f"no {state_path} found -- restarting curriculum"
 
     # Printed after resume so it reflects what's actually in effect for the
@@ -467,7 +511,14 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
     print(f"  Episodes:    {train_cfg.episodes}  (starting at {start_episode})")
     print(f"  Augment:     {train_cfg.use_augmentation}")
     print(f"  Checkpoints: {checkpoint_dir}")
-    if train_cfg.curriculum_enabled:
+    if train_cfg.pin_distance_m is not None:
+        print(
+            f"  Curriculum:  PINNED at {current_max_dist:.1f}m -- "
+            "auto-advance/regress disabled for this run"
+        )
+        if curriculum_state_note:
+            print(f"               ({curriculum_state_note})")
+    elif train_cfg.curriculum_enabled:
         current_dist_label = "uncapped" if current_max_dist is None else f"{current_max_dist:.1f}m"
         print(
             f"  Curriculum:  current={current_dist_label}  "
@@ -483,6 +534,7 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
     print("=" * 60)
 
     best_success_rate = 0.0
+    consecutive_low_checks = 0  # resets per-process; see curriculum_regress_patience
 
     if not train_cfg.resume_path:
         print(f"  Warming up replay buffer (target: {agent.cfg.min_buffer_size} transitions)...")
@@ -502,23 +554,48 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
 
             if (
                 train_cfg.curriculum_enabled
-                and current_max_dist is not None
+                and train_cfg.pin_distance_m is None
                 and episode % train_cfg.curriculum_check_every == 0
                 and logger.history_len >= train_cfg.curriculum_min_episodes
-                and logger.success_rate / 100.0 >= train_cfg.curriculum_threshold
             ):
-                current_max_dist += train_cfg.curriculum_step_m
-                if current_max_dist >= curriculum_final_m:
-                    current_max_dist = None
-                    env.set_max_spawn_distance(None)
-                    print(f"[{episode:5d}] Curriculum complete -- goals now sampled with no distance cap.")
+                if logger.success_rate / 100.0 >= train_cfg.curriculum_threshold:
+                    consecutive_low_checks = 0
+                    if current_max_dist is not None:
+                        current_max_dist += train_cfg.curriculum_step_m
+                        if current_max_dist >= curriculum_final_m:
+                            current_max_dist = None
+                            env.set_max_spawn_distance(None)
+                            print(f"[{episode:5d}] Curriculum complete -- goals now sampled with no distance cap.")
+                        else:
+                            env.set_max_spawn_distance(current_max_dist)
+                            print(
+                                f"[{episode:5d}] Curriculum advance -> max_spawn_distance="
+                                f"{current_max_dist:.1f}m (success_rate={logger.success_rate:.1f}%)"
+                            )
+                        _save_curriculum_state(checkpoint_dir, current_max_dist)
                 else:
-                    env.set_max_spawn_distance(current_max_dist)
-                    print(
-                        f"[{episode:5d}] Curriculum advance -> max_spawn_distance="
-                        f"{current_max_dist:.1f}m (success_rate={logger.success_rate:.1f}%)"
-                    )
-                _save_curriculum_state(checkpoint_dir, current_max_dist)
+                    # Advancing is otherwise a one-way ratchet: it only ever raises
+                    # the distance, with no way back even if performance later
+                    # collapses at that distance (exactly what happened over a
+                    # 70k-episode run -- success kept declining for 50k+ episodes
+                    # with no mechanism to back off). After enough *consecutive*
+                    # failed checks (not just one bad window right after an
+                    # advance), step back down so the agent can re-consolidate.
+                    consecutive_low_checks += 1
+                    if consecutive_low_checks >= train_cfg.curriculum_regress_patience:
+                        effective_current = current_max_dist if current_max_dist is not None else curriculum_final_m
+                        new_max_dist = max(train_cfg.curriculum_start_m, effective_current - train_cfg.curriculum_step_m)
+                        if new_max_dist < effective_current:
+                            current_max_dist = new_max_dist
+                            env.set_max_spawn_distance(current_max_dist)
+                            _save_curriculum_state(checkpoint_dir, current_max_dist)
+                            print(
+                                f"[{episode:5d}] Curriculum regress -> max_spawn_distance="
+                                f"{current_max_dist:.1f}m (success_rate stayed below "
+                                f"{train_cfg.curriculum_threshold * 100:.0f}% for "
+                                f"{consecutive_low_checks} consecutive checks)"
+                            )
+                        consecutive_low_checks = 0
 
             # While the curriculum is still capping goal distance, the rolling
             # success rate reflects an easier task than full deployment and
@@ -597,6 +674,12 @@ def parse_args() -> argparse.Namespace:
         help="Rolling-100 success rate (0-1) required to advance the curriculum's max spawn distance."
     )
     parser.add_argument(
+        "--pin-distance", type=float, default=None,
+        help="Freeze max_spawn_distance_m at this value and disable curriculum "
+             "auto-advance/regress for this run -- for deliberately consolidating "
+             "at a fixed distance before letting the curriculum move again."
+    )
+    parser.add_argument(
         "--max-steps", type=int, default=500,
         help="Max steps per episode before timeout."
     )
@@ -639,6 +722,7 @@ def main():
         use_augmentation=not args.no_augment,
         curriculum_enabled=not args.no_curriculum,
         curriculum_threshold=args.curriculum_threshold,
+        pin_distance_m=args.pin_distance,
         resume_path=args.resume,
         seed=args.seed,
     )

@@ -63,7 +63,15 @@ class RoverEnvConfig:
     #Episode
     max_steps: int = 500                #Hard cut-off per episode
     goal_radius_m: float = 0.5          #Distance at which goal is considered reached
-    collision_penalty: float = -1.0     #Reward on collision
+    collision_penalty: float = -0.3     #Reward on collision -- kept smaller than one
+                                         #step's max progress reward (progress_scale *
+                                         #move_step_m = 1.25) so the policy doesn't learn
+                                         #to favor "safe" turning over committing to
+                                         #forward progress (see eval findings: collision
+                                         #rate hit 0% once escapes were turn-only, but
+                                         #the underlying stuck-loop rate didn't budge --
+                                         #consistent with a policy that was avoiding
+                                         #forward movement, not avoiding collisions)
     goal_reward: float = 10.0           #Reward on reaching goal
     progress_scale: float = 5.0         #Multiplier on geodesic progress reward
     time_penalty: float = 0.01          #Per-step penalty to encourage efficiency

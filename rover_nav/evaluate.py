@@ -19,12 +19,14 @@ Usage:
     python rover_nav/evaluate.py \
         --checkpoint checkpoints/ECE_floor/d3qn_best.pt \
         --scene /home/user/data/habitat-sim/versioned_data/habitat_test_scenes/ECE_floor.glb \
-        --episodes 100
+        --episodes 100 \
+        --max-spawn-distance 14.0
 """
 
 import argparse
 import random
 from collections import deque
+from typing import Optional
 
 import numpy as np
 import torch
@@ -70,12 +72,26 @@ def run_eval_episode(env: RoverEnv, frame_stack: FrameStack, agent: D3QNAgent) -
             and max(recent_dists) - min(recent_dists) < STUCK_DIST_EPS
         )
         if stuck:
-            action = random.randint(0, agent.cfg.n_actions - 1)
+            # Two-part escape: turn first to change heading, then step
+            # forward to actually change position -- turning alone doesn't
+            # move the agent, so the detection window would immediately
+            # re-trigger on the very next 20-step fill.
+            for escape_action in (random.choice(STUCK_ESCAPE_ACTIONS), Action.FORWARD):
+                raw_next_obs, reward, done, info = env.step(escape_action)
+                state = frame_stack.step(raw_next_obs)
+                episode_reward += reward
+                steps += 1
+                if info["collision"]:
+                    collisions += 1
+                goal_reached = info["goal_reached"]
+                timeout = info["timeout"]
+                if done:
+                    break
             recent_dists.clear()
             stuck_escapes += 1
-        else:
-            action = agent.select_action(state)
+            continue
 
+        action = agent.select_action(state)
         raw_next_obs, reward, done, info = env.step(action)
         state = frame_stack.step(raw_next_obs)
 
@@ -101,9 +117,21 @@ def run_eval_episode(env: RoverEnv, frame_stack: FrameStack, agent: D3QNAgent) -
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate(checkpoint_path: str, scene_path: str, episodes: int, max_steps: int) -> dict:
-    env_cfg = RoverEnvConfig(scene_path=scene_path, max_steps=max_steps)
+def evaluate(
+    checkpoint_path: str,
+    scene_path: str,
+    episodes: int,
+    max_steps: int,
+    max_spawn_distance: Optional[float] = None,
+) -> dict:
+    env_cfg = RoverEnvConfig(
+        scene_path=scene_path,
+        max_steps=max_steps,
+        max_spawn_distance_m=max_spawn_distance,
+    )
     env = RoverEnv(config=env_cfg)
+    dist_label = "uncapped (full scene)" if max_spawn_distance is None else f"{max_spawn_distance:.1f}m"
+    print(f"[evaluate.py] Goal spawn distance: {dist_label}")
     frame_stack = FrameStack(augment=False)
 
     agent = D3QNAgent(AgentConfig(n_actions=Action.COUNT))
@@ -165,6 +193,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene", type=str, required=True, help="Path to the .glb scene file.")
     parser.add_argument("--episodes", type=int, default=100, help="Number of evaluation episodes.")
     parser.add_argument("--max-steps", type=int, default=500, help="Max steps per episode before timeout.")
+    parser.add_argument(
+        "--max-spawn-distance", type=float, default=None,
+        help="Cap goal-to-start spawn distance (meters), matching a training curriculum "
+             "stage (see checkpoints/<scene>/curriculum_state.json). Default: uncapped, "
+             "i.e. goals sampled anywhere on the navmesh -- this may be a harder "
+             "distribution than the checkpoint was actually trained on."
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -175,7 +210,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    evaluate(args.checkpoint, args.scene, args.episodes, args.max_steps)
+    evaluate(args.checkpoint, args.scene, args.episodes, args.max_steps, args.max_spawn_distance)
 
 
 if __name__ == "__main__":
