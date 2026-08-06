@@ -49,7 +49,7 @@ class AgentConfig:
     input_channels: int = 4         #Frame stack depth (STACK_SIZE in preprocess.py)
     frame_h: int        = 84
     frame_w: int        = 84
-    goal_dim: int       = 2         #Must match RoverEnv.get_goal_dim() in sim_env.py
+    goal_dim: int       = 3         #Must match RoverEnv.get_goal_dim() in sim_env.py
 
     # --- Replay buffer ---
     buffer_size: int    = 100_000   #Max transitions stored
@@ -62,7 +62,7 @@ class AgentConfig:
 
     # --- Exploration (epsilon-greedy) ---
     epsilon_start: float = 1.0      #Start fully random
-    epsilon_min: float   = 0.05     #Never drop below 5% random
+    epsilon_min: float   = 0.01     #Never drop below 1% random
     epsilon_decay: float = 0.995    #Multiplicative decay per episode
 
     # --- Target network ---
@@ -130,6 +130,46 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._buf)
+
+    def state_dict(self) -> dict:
+        """
+        Serialize buffer contents as stacked arrays for checkpointing.
+
+        Frames are cast to uint8 (they're stored as float32 in [0, 1] for
+        network input, but originate from uint8 [0, 255] camera frames --
+        see preprocess.py -- so this round-trips losslessly while cutting
+        the on-disk size 4x).
+        """
+        if len(self._buf) == 0:
+            return {"empty": True}
+
+        frames, goals, actions, rewards, next_frames, next_goals, dones = zip(*self._buf)
+        return {
+            "empty": False,
+            "frames": (np.array(frames) * 255).astype(np.uint8),
+            "goals": np.array(goals, dtype=np.float32),
+            "actions": np.array(actions, dtype=np.int64),
+            "rewards": np.array(rewards, dtype=np.float32),
+            "next_frames": (np.array(next_frames) * 255).astype(np.uint8),
+            "next_goals": np.array(next_goals, dtype=np.float32),
+            "dones": np.array(dones, dtype=np.float32),
+        }
+
+    def load_state_dict(self, state: dict):
+        """Restore buffer contents saved by state_dict(). Clears any existing contents."""
+        self._buf.clear()
+        if state.get("empty", True):
+            return
+
+        frames = state["frames"].astype(np.float32) / 255.0
+        next_frames = state["next_frames"].astype(np.float32) / 255.0
+        for i in range(len(state["actions"])):
+            self._buf.append((
+                frames[i], state["goals"][i],
+                int(state["actions"][i]), float(state["rewards"][i]),
+                next_frames[i], state["next_goals"][i],
+                bool(state["dones"][i]),
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +460,13 @@ class D3QNAgent:
     # Checkpointing
     # -----------------------------------------------------------------------
 
-    def save(self, path: str):
+    @staticmethod
+    def _buffer_path(path: str) -> str:
+        """Companion file path for a checkpoint's replay buffer, e.g. d3qn_latest.pt -> d3qn_latest_buffer.npz."""
+        root, _ = os.path.splitext(path)
+        return f"{root}_buffer.npz"
+
+    def save(self, path: str, include_buffer: bool = False):
         """
         Save the full agent state to disk.
 
@@ -428,21 +474,34 @@ class D3QNAgent:
         so training can be resumed exactly where it left off.
 
         Args:
-            path: File path, e.g. "checkpoints/d3qn_ep500.pt"
+            path:           File path, e.g. "checkpoints/d3qn_ep500.pt"
+            include_buffer: If True, also serialize the replay buffer to a
+                             companion "<path>_buffer.npz" file (uint8 frames
+                             -- see ReplayBuffer.state_dict). Kept out of the
+                             main torch.save pickle because pickling numpy
+                             arrays through torch.save costs ~50% extra size
+                             over their raw bytes; np.savez stores them at
+                             raw size. A full 100k-capacity buffer still
+                             runs several GB, so this should only be set for
+                             the checkpoint(s) actually used with --resume
+                             (e.g. d3qn_latest.pt), not for the numbered
+                             archival checkpoints or d3qn_best.pt -- otherwise
+                             every checkpoint on disk balloons for no benefit,
+                             since only --resume needs a warm buffer.
         """
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(
-            {
-                "online_net":  self.online_net.state_dict(),
-                "target_net":  self.target_net.state_dict(),
-                "optimizer":   self.optimizer.state_dict(),
-                "epsilon":     self.epsilon,
-                "total_steps": self.total_steps,
-                "episodes":    self.episodes,
-                "config":      self.cfg,
-            },
-            path,
-        )
+        state = {
+            "online_net":  self.online_net.state_dict(),
+            "target_net":  self.target_net.state_dict(),
+            "optimizer":   self.optimizer.state_dict(),
+            "epsilon":     self.epsilon,
+            "total_steps": self.total_steps,
+            "episodes":    self.episodes,
+            "config":      self.cfg,
+        }
+        torch.save(state, path)
+        if include_buffer:
+            np.savez(self._buffer_path(path), **self.memory.state_dict())
         print(f"[D3QNAgent] Checkpoint saved -> {path}")
 
     def load(self, path: str, eval_mode: bool = False):
@@ -465,6 +524,12 @@ class D3QNAgent:
         self.epsilon     = checkpoint["epsilon"]
         self.total_steps = checkpoint["total_steps"]
         self.episodes    = checkpoint["episodes"]
+
+        buffer_path = self._buffer_path(path)
+        if os.path.exists(buffer_path):
+            with np.load(buffer_path) as npz:
+                self.memory.load_state_dict(dict(npz))
+            print(f"[D3QNAgent] Restored replay buffer ({len(self.memory)} transitions) <- {buffer_path}")
 
         if eval_mode:
             self.epsilon = 0.0

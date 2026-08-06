@@ -174,7 +174,8 @@ class RoverEnv:
             self._goal_pos
         )
 
-        goal_vec = self._goal_vector(self._get_agent_pos(), self._prev_dist)
+        # -1 sentinel: no previous action at episode start (normalized to ~-0.2)
+        goal_vec = self._goal_vector(self._get_agent_pos(), self._prev_dist, prev_action=-1)
         return self._get_observation(), goal_vec
 
     def step(self, action: int) -> Tuple[Tuple[np.ndarray, np.ndarray], float, bool, dict]:
@@ -211,7 +212,7 @@ class RoverEnv:
         self._prev_dist = curr_dist
         done = goal_reached or timeout
 
-        goal_vec = self._goal_vector(agent_pos, curr_dist)
+        goal_vec = self._goal_vector(agent_pos, curr_dist, prev_action=action)
 
         info = {
             "step": self._step_count,
@@ -246,7 +247,15 @@ class RoverEnv:
         Returns the length of the goal vector returned alongside each frame.
         Must match AgentConfig.goal_dim in agent.py.
         """
-        return 2
+        return 3
+
+    def get_spawn_distance(self) -> float:
+        """
+        Returns the geodesic goal distance for the current episode, as set by
+        the last reset(). Read this right after reset() -- step() updates the
+        underlying value to the agent's current distance to goal.
+        """
+        return self._prev_dist
 
     def set_max_spawn_distance(self, max_dist: Optional[float]):
         """
@@ -298,6 +307,8 @@ class RoverEnv:
         backend_cfg.scene_id = self.cfg.scene_path
         backend_cfg.enable_physics = False
         backend_cfg.gpu_device_id = 0
+        backend_cfg.override_scene_light_defaults = True
+        backend_cfg.scene_light_setup = habitat_sim.gfx.DEFAULT_LIGHTING_KEY
 
         #RGB camera sensor
         rgb_sensor = habitat_sim.CameraSensorSpec()
@@ -399,19 +410,25 @@ class RoverEnv:
         return float(reward)
     
     #Navigation helpers
-    def _goal_vector(self, agent_pos: np.ndarray, dist: float) -> np.ndarray:
+    def _goal_vector(self, agent_pos: np.ndarray, dist: float, prev_action: int = -1) -> np.ndarray:
         """
-        Egocentric goal vector: [normalized_distance, normalized_relative_heading].
+        Egocentric goal vector: [normalized_distance, normalized_relative_heading,
+                                  normalized_prev_action].
 
         A raw camera frame can't tell the agent which way a randomly-placed
         goal is, so this gets passed through the pipeline alongside the
         frame (see preprocess.FrameStack and agent.D3QN) as a PointGoal-style
         sensor would in habitat-lab.
 
-        normalized_distance:  geodesic distance / goal_dist_norm_m, clipped to [0, 1]
-        normalized_heading:   angle from the agent's facing direction to the
-                               goal, in [-1, 1] where 0 = straight ahead,
-                               +/-1 = directly behind.
+        normalized_distance:   geodesic distance / goal_dist_norm_m, clipped to [0, 1]
+        normalized_heading:    angle from the agent's facing direction to the
+                                goal, in [-1, 1] where 0 = straight ahead,
+                                +/-1 = directly behind.
+        normalized_prev_action: prev_action / Action.COUNT, in [0.0, 0.8] for real
+                                 actions; -1/COUNT (~-0.2) at episode start (no prior
+                                 action). Gives the network memory of what it just did
+                                 so it can learn to break deterministic action cycles
+                                 without relying on epsilon noise.
         """
         agent_state = self._agent.get_state()
         q = agent_state.rotation
@@ -426,8 +443,9 @@ class RoverEnv:
 
         norm_dist = min(dist / self.cfg.goal_dist_norm_m, 1.0)
         norm_heading = rel_heading / math.pi
+        norm_prev_action = prev_action / Action.COUNT  # -0.2 at reset, [0.0, 0.8] thereafter
 
-        return np.array([norm_dist, norm_heading], dtype=np.float32)
+        return np.array([norm_dist, norm_heading, norm_prev_action], dtype=np.float32)
 
     def _get_agent_pos(self) -> np.ndarray:
         """
@@ -535,7 +553,7 @@ class RoverEnv:
             light_setup = []
             n_lights = random.randint(1, 3)
             for i in range(n_lights):
-                light = habitat_sim.LightInfo(
+                light = habitat_sim.gfx.LightInfo(
                     vector=[
                         random.uniform(-1, 1),
                         random.uniform(0.5, 1.5),
@@ -547,13 +565,12 @@ class RoverEnv:
                         random.uniform(0.7, 1.0),
                         random.uniform(0.6, 0.9),
                     ],
-                    model=habitat_sim.LightPositionModel.Global,
+                    model=habitat_sim.gfx.LightPositionModel.Global,
                 )
                 light_setup.append(light)
-            self._sim.set_light_setup(light_setup)
-        except (AttributeError, Exception):
-            #Lighting API not available in this build
-            print("Lighitng API not available in this build. Skipping.")
+            self._sim.set_light_setup(light_setup, habitat_sim.gfx.DEFAULT_LIGHTING_KEY)
+        except (AttributeError, Exception) as e:
+            print(f"Lighting randomization failed ({e}). Skipping.")
             pass
 
     #Context manager support ------------------------------------------------
@@ -606,7 +623,7 @@ if __name__ == "__main__":
         frame, goal_vec = env.reset()
         print(f"  reset() -> frame.shape={frame.shape}, dtype={frame.dtype}, goal_vec={goal_vec}")
         assert frame.shape == (480, 640, 4)
-        assert goal_vec.shape == (2,)
+        assert goal_vec.shape == (3,)
 
         total_reward = 0.0
         for step in range(20):

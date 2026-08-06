@@ -8,3 +8,4 @@ guide.py
 checkpoints/
 rover_nav/__pycache__/
 logs/
+HANDOFF.md

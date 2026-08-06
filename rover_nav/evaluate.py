@@ -21,15 +21,29 @@ Usage:
         --scene /home/user/data/habitat-sim/versioned_data/habitat_test_scenes/ECE_floor.glb \
         --episodes 100 \
         --max-spawn-distance 14.0
+
+Distance sweep (success rate as a function of spawn distance, plotted and
+saved to a PNG -- goals are sampled uncapped across the full scene so the
+sweep isn't limited to one curriculum stage):
+    python rover_nav/evaluate.py \
+        --checkpoint checkpoints/ECE_floor/d3qn_latest.pt \
+        --scene /home/user/data/habitat-sim/versioned_data/habitat_test_scenes/ECE_floor.glb \
+        --episodes 300 \
+        --distance-sweep
 """
 
 import argparse
+import os
 import random
 from collections import deque
 from typing import Optional
 
 import numpy as np
 import torch
+
+import matplotlib
+matplotlib.use("Agg")  # headless -- no display to render to
+import matplotlib.pyplot as plt
 
 from sim_env import RoverEnv, RoverEnvConfig, Action
 from preprocess import FrameStack
@@ -43,10 +57,13 @@ from agent import D3QNAgent, AgentConfig
 # A pure-greedy (epsilon=0) DQN policy has no noise to break ties, so it can
 # lock into a repeating action cycle -- e.g. turning in place or nosing into
 # the same wall forever. If the geodesic distance to goal hasn't moved by
-# more than STUCK_DIST_EPS over STUCK_WINDOW steps, we inject an escape
-# action to knock it out of the loop. The escape is restricted to
-# turning -- a FORWARD/BACKWARD escape just re-collides with whatever the
-# agent is already stuck against, since that's almost always why it's stuck.
+# more than STUCK_DIST_EPS over STUCK_WINDOW steps, we inject a random turn
+# to break the cycle. After the turn, recent_dists is cleared so the policy
+# gets STUCK_WINDOW fresh steps with the new heading before re-triggering.
+# FORWARD was previously added as a second escape step to change position,
+# but it caused the agent to nose into walls on almost every escape (89%
+# collision rate) since the agent is usually stuck because there is a wall
+# directly in front of it. Turn-only avoids that.
 STUCK_WINDOW = 20
 STUCK_DIST_EPS = 0.05  # meters
 STUCK_ESCAPE_ACTIONS = (Action.LEFT, Action.RIGHT)
@@ -55,6 +72,7 @@ STUCK_ESCAPE_ACTIONS = (Action.LEFT, Action.RIGHT)
 def run_eval_episode(env: RoverEnv, frame_stack: FrameStack, agent: D3QNAgent) -> dict:
     """Run one episode greedily (no learning, minimal exploration) and return its outcome."""
     raw_obs = env.reset()
+    spawn_distance = env.get_spawn_distance()
     state = frame_stack.reset(raw_obs)
 
     episode_reward = 0.0
@@ -72,21 +90,15 @@ def run_eval_episode(env: RoverEnv, frame_stack: FrameStack, agent: D3QNAgent) -
             and max(recent_dists) - min(recent_dists) < STUCK_DIST_EPS
         )
         if stuck:
-            # Two-part escape: turn first to change heading, then step
-            # forward to actually change position -- turning alone doesn't
-            # move the agent, so the detection window would immediately
-            # re-trigger on the very next 20-step fill.
-            for escape_action in (random.choice(STUCK_ESCAPE_ACTIONS), Action.FORWARD):
-                raw_next_obs, reward, done, info = env.step(escape_action)
-                state = frame_stack.step(raw_next_obs)
-                episode_reward += reward
-                steps += 1
-                if info["collision"]:
-                    collisions += 1
-                goal_reached = info["goal_reached"]
-                timeout = info["timeout"]
-                if done:
-                    break
+            escape_action = random.choice(STUCK_ESCAPE_ACTIONS)
+            raw_next_obs, reward, done, info = env.step(escape_action)
+            state = frame_stack.step(raw_next_obs)
+            episode_reward += reward
+            steps += 1
+            if info["collision"]:
+                collisions += 1
+            goal_reached = info["goal_reached"]
+            timeout = info["timeout"]
             recent_dists.clear()
             stuck_escapes += 1
             continue
@@ -110,6 +122,7 @@ def run_eval_episode(env: RoverEnv, frame_stack: FrameStack, agent: D3QNAgent) -
         "goal_reached": goal_reached,
         "timeout": timeout,
         "stuck_escapes": stuck_escapes,
+        "spawn_distance": spawn_distance,
     }
 
 
@@ -182,6 +195,124 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
+# Distance sweep
+# ---------------------------------------------------------------------------
+#
+# Split into three reusable pieces so train.py can run a periodic sweep with
+# its own live env/agent/frame_stack (no need to rebuild the simulator or
+# reload a checkpoint from disk just to sweep), while the CLI path below
+# builds its own env/agent from a saved checkpoint.
+
+def bin_distance_sweep(results: list, bin_size_m: float = 1.0) -> tuple:
+    """
+    Bin run_eval_episode() results by actual spawn distance.
+
+    Returns (bin_centers, bin_success_rates, bin_counts), all lists, with
+    empty bins dropped rather than shown as 0%-of-0.
+    """
+    distances = np.array([r["spawn_distance"] for r in results])
+    goal_reached = np.array([r["goal_reached"] for r in results])
+
+    n_bins = max(1, int(np.ceil(distances.max() / bin_size_m)))
+    bin_edges = np.arange(0, (n_bins + 1) * bin_size_m, bin_size_m)
+    bin_indices = np.clip(np.digitize(distances, bin_edges) - 1, 0, n_bins - 1)
+
+    bin_centers, bin_success_rates, bin_counts = [], [], []
+    for b in range(n_bins):
+        mask = bin_indices == b
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        bin_centers.append(float(bin_edges[b] + bin_size_m / 2))
+        bin_success_rates.append(float(goal_reached[mask].mean()) * 100)
+        bin_counts.append(count)
+
+    return bin_centers, bin_success_rates, bin_counts
+
+
+def plot_distance_sweep(
+    bin_centers: list,
+    bin_success_rates: list,
+    bin_counts: list,
+    bin_size_m: float,
+    save_path: str,
+    title: str,
+):
+    """Bar chart of success rate per distance bin, annotated with each bin's sample count."""
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.figure(figsize=(10, 5))
+    plt.bar(bin_centers, bin_success_rates, width=bin_size_m * 0.9)
+    for c, rate, n in zip(bin_centers, bin_success_rates, bin_counts):
+        plt.text(c, rate + 3, f"n={n}", ha="center", va="bottom", fontsize=7, rotation=90)
+    plt.xlabel("Spawn distance (m)")
+    plt.ylabel("Success rate (%)")
+    plt.title(title)
+    plt.ylim(0, 115)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(save_path)
+    plt.close()
+
+
+def evaluate_distance_sweep(
+    checkpoint_path: str,
+    scene_path: str,
+    episodes: int,
+    max_steps: int,
+    bin_size_m: float = 1.0,
+    save_path: Optional[str] = None,
+) -> dict:
+    """
+    Run episodes with goals sampled uncapped across the full scene, bin
+    outcomes by actual spawn distance, and report/plot success rate per bin.
+
+    Unlike evaluate(), which reports one success rate at a fixed distance
+    cap (matching a curriculum stage), this shows *where* performance falls
+    off as goals get farther -- useful for picking the next curriculum
+    target or diagnosing a checkpoint's real operating range.
+    """
+    env_cfg = RoverEnvConfig(scene_path=scene_path, max_steps=max_steps, max_spawn_distance_m=None)
+    env = RoverEnv(config=env_cfg)
+    print(f"[evaluate.py] Distance sweep: {episodes} episodes, goals uncapped (full scene)")
+    frame_stack = FrameStack(augment=False)
+
+    agent = D3QNAgent(AgentConfig(n_actions=Action.COUNT))
+    agent.load(checkpoint_path, eval_mode=True)
+
+    results = []
+    try:
+        for ep in range(1, episodes + 1):
+            result = run_eval_episode(env, frame_stack, agent)
+            results.append(result)
+            print(
+                f"[{ep:4d}/{episodes}] spawn_dist={result['spawn_distance']:6.2f}m "
+                f"goal_reached={result['goal_reached']} timeout={result['timeout']}"
+            )
+    finally:
+        env.close()
+
+    bin_centers, bin_success_rates, bin_counts = bin_distance_sweep(results, bin_size_m)
+
+    print("=" * 60)
+    print(f"Distance sweep over {len(results)} episodes -- {checkpoint_path}")
+    print("=" * 60)
+    for c, rate, n in zip(bin_centers, bin_success_rates, bin_counts):
+        print(f"  {c:5.1f}m: {rate:5.1f}% success (n={n})")
+
+    if save_path:
+        plot_distance_sweep(
+            bin_centers, bin_success_rates, bin_counts, bin_size_m, save_path,
+            title=f"Success Rate vs. Spawn Distance -- {os.path.basename(checkpoint_path)}",
+        )
+        print(f"\nSaved plot -> {save_path}")
+
+    return {
+        "bin_centers": bin_centers,
+        "bin_success_rates": bin_success_rates,
+        "bin_counts": bin_counts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -201,6 +332,21 @@ def parse_args() -> argparse.Namespace:
              "distribution than the checkpoint was actually trained on."
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument(
+        "--distance-sweep", action="store_true",
+        help="Instead of one fixed-distance evaluation, run episodes with goals "
+             "sampled uncapped across the full scene and plot success rate as a "
+             "function of actual spawn distance. Ignores --max-spawn-distance."
+    )
+    parser.add_argument(
+        "--bin-size", type=float, default=1.0,
+        help="Distance bin width in meters for --distance-sweep."
+    )
+    parser.add_argument(
+        "--save-path", type=str, default=None,
+        help="Where to save the --distance-sweep plot. Default: "
+             "logs/<scene_name>/success_vs_distance.png"
+    )
     return parser.parse_args()
 
 
@@ -210,7 +356,17 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    evaluate(args.checkpoint, args.scene, args.episodes, args.max_steps, args.max_spawn_distance)
+    if args.distance_sweep:
+        save_path = args.save_path
+        if save_path is None:
+            scene_name = os.path.splitext(os.path.basename(args.scene))[0]
+            save_path = os.path.join("logs", scene_name, "success_vs_distance.png")
+        evaluate_distance_sweep(
+            args.checkpoint, args.scene, args.episodes, args.max_steps,
+            args.bin_size, save_path,
+        )
+    else:
+        evaluate(args.checkpoint, args.scene, args.episodes, args.max_steps, args.max_spawn_distance)
 
 
 if __name__ == "__main__":

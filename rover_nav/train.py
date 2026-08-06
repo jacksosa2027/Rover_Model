@@ -41,6 +41,10 @@ import torch
 from sim_env import RoverEnv, RoverEnvConfig, Action
 from preprocess import FrameStack
 from agent import D3QNAgent, AgentConfig
+from evaluate import (
+    run_eval_episode, bin_distance_sweep, plot_distance_sweep,
+    STUCK_WINDOW, STUCK_DIST_EPS, STUCK_ESCAPE_ACTIONS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,30 @@ class TrainConfig:
                                              # the distance back down -- advancing is a
                                              # one-way ratchet otherwise, which can push
                                              # into a distance the agent never recovers from
+    # --- Distance sweep diagnostics ---
+    # The rolling in-training success rate is measured at whatever the
+    # curriculum's current capped distance is, which can hide a checkpoint's
+    # real drop-off point (a capped eval mixes in easy nearby goals -- see
+    # success_vs_distance.png history). Periodically run a separate batch of
+    # uncapped-goal episodes and plot success rate vs. actual spawn distance
+    # so that drop-off is visible without waiting for a manual evaluate.py run.
+    distance_sweep_every:    int = 25_000  # episodes between sweeps; 0 disables
+    distance_sweep_episodes: int = 150
+    distance_sweep_bin_m:    float = 5.0
+
+    # --- Stuck-loop escape (training-side) ---
+    # evaluate.py has always detected repetitive stuck cycles (no geodesic
+    # progress over STUCK_WINDOW steps) and forced a random turn to escape --
+    # but only at eval time. Training never exercised that behavior, so the
+    # replay buffer never contained a single "stuck -> escape -> outcome"
+    # transition for the network to learn from; escaping was a policy the
+    # agent was graded on at eval but never practiced during training. This
+    # mirrors the same detector into the training rollout, plus an explicit
+    # penalty so stalling has a direct negative learning signal rather than
+    # relying solely on the forced escape action itself to teach it.
+    stuck_escape_enabled: bool = True
+    stuck_penalty:        float = -0.5
+
     pin_distance_m: Optional[float] = None  # freeze max_spawn_distance here, disabling
                                              # auto-advance/regress entirely -- for
                                              # deliberately consolidating at a fixed
@@ -121,12 +149,33 @@ def run_episode(
     step_count = 0
     goal_reached = False
     collisions = 0
+    stuck_escapes = 0
+    recent_dists: deque = deque(maxlen=STUCK_WINDOW)
 
     done = False
     while not done:
-        action = agent.select_action(state)
+        stuck = (
+            train_cfg.stuck_escape_enabled
+            and len(recent_dists) == STUCK_WINDOW
+            and max(recent_dists) - min(recent_dists) < STUCK_DIST_EPS
+        )
+        if stuck:
+            action = random.choice(STUCK_ESCAPE_ACTIONS)
+        else:
+            action = agent.select_action(state)
+
         raw_next_obs, reward, done, info = env.step(action)
         next_state = frame_stack.step(raw_next_obs)
+
+        if stuck:
+            # On top of whatever env.step() already returned, so the agent
+            # gets a direct signal that stalling is bad rather than relying
+            # solely on the forced escape action to teach it that.
+            reward += train_cfg.stuck_penalty
+            stuck_escapes += 1
+            recent_dists.clear()
+        else:
+            recent_dists.append(info["dist_to_goal"])
 
         agent.remember(state, action, reward, next_state, done)
 
@@ -147,6 +196,7 @@ def run_episode(
         "steps":          step_count,
         "goal_reached":   goal_reached,
         "collisions":     collisions,
+        "stuck_escapes":  stuck_escapes,
         "mean_loss":      float(np.mean(episode_losses)) if episode_losses else 0.0,
         "epsilon":        agent.epsilon,
     }
@@ -165,7 +215,7 @@ class TrainingLogger:
 
     FIELDS = [
         "episode", "reward", "steps", "goal_reached",
-        "collisions", "mean_loss", "epsilon", "elapsed_sec",
+        "collisions", "stuck_escapes", "mean_loss", "epsilon", "elapsed_sec",
     ]
 
     def __init__(self, csv_path: str):
@@ -203,6 +253,7 @@ class TrainingLogger:
             "steps":        metrics["steps"],
             "goal_reached": int(metrics["goal_reached"]),
             "collisions":   metrics["collisions"],
+            "stuck_escapes": metrics["stuck_escapes"],
             "mean_loss":    round(metrics["mean_loss"], 6),
             "epsilon":      round(metrics["epsilon"], 4),
             "elapsed_sec":  round(elapsed_sec, 2),
@@ -409,6 +460,7 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
     success_plot_path = os.path.join(log_dir, "success_rate.png")
     reward_plot_path = os.path.join(log_dir, "avg_reward.png")
     steps_plot_path = os.path.join(log_dir, "avg_steps_to_goal.png")
+    distance_sweep_plot_path = os.path.join(log_dir, "success_vs_distance.png")
 
     current_max_dist = train_cfg.curriculum_start_m if train_cfg.curriculum_enabled else None
     if train_cfg.pin_distance_m is not None:
@@ -619,18 +671,56 @@ def train(train_cfg: TrainConfig, env_cfg: RoverEnvConfig, agent_cfg: AgentConfi
                 )
                 agent.save(ckpt_path)
 
-                # Also keep a rolling "latest" checkpoint for easy resume
+                # Also keep a rolling "latest" checkpoint for easy resume.
+                # Includes the replay buffer so --resume doesn't restart
+                # learning from a cold, empty buffer.
                 latest_path = os.path.join(
                     checkpoint_dir, "d3qn_latest.pt"
                 )
-                agent.save(latest_path)
+                agent.save(latest_path, include_buffer=True)
+
+            if (
+                train_cfg.distance_sweep_every > 0
+                and episode % train_cfg.distance_sweep_every == 0
+            ):
+                print(
+                    f"[{episode:5d}] Running distance sweep "
+                    f"({train_cfg.distance_sweep_episodes} episodes, goals uncapped)..."
+                )
+                # Borrow the live env/agent/frame_stack rather than rebuilding
+                # them -- greedy policy, uncapped goals, no learning -- then
+                # restore exactly the training state (epsilon, train() mode,
+                # curriculum cap) so the next training episode is unaffected.
+                saved_epsilon = agent.epsilon
+                agent.epsilon = 0.0
+                agent.online_net.eval()
+                env.set_max_spawn_distance(None)
+
+                sweep_results = [
+                    run_eval_episode(env, frame_stack, agent)
+                    for _ in range(train_cfg.distance_sweep_episodes)
+                ]
+
+                env.set_max_spawn_distance(current_max_dist)
+                agent.online_net.train()
+                agent.epsilon = saved_epsilon
+
+                bin_centers, bin_success_rates, bin_counts = bin_distance_sweep(
+                    sweep_results, train_cfg.distance_sweep_bin_m
+                )
+                plot_distance_sweep(
+                    bin_centers, bin_success_rates, bin_counts,
+                    train_cfg.distance_sweep_bin_m, distance_sweep_plot_path,
+                    title=f"Success Rate vs. Spawn Distance -- episode {episode}",
+                )
+                print(f"[{episode:5d}] Distance sweep saved -> {distance_sweep_plot_path}")
 
     except KeyboardInterrupt:
         print("\n[train.py] Interrupted by user. Saving checkpoint before exit...")
         interrupt_path = os.path.join(
             checkpoint_dir, f"d3qn_interrupted_ep{agent.episodes}.pt"
         )
-        agent.save(interrupt_path)
+        agent.save(interrupt_path, include_buffer=True)
 
     finally:
         env.close()
@@ -688,6 +778,10 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save model checkpoints."
     )
     parser.add_argument(
+        "--log-dir", type=str, default="logs",
+        help="Directory to save training logs/plots."
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for reproducibility."
     )
@@ -719,6 +813,7 @@ def main():
         scene_path=args.scene,
         episodes=args.episodes,
         checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.log_dir,
         use_augmentation=not args.no_augment,
         curriculum_enabled=not args.no_curriculum,
         curriculum_threshold=args.curriculum_threshold,
